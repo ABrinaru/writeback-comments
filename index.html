@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Dashboard Comments</title>
+
+<!-- Local copy of the Tableau Extensions API runtime, see README.md -->
+<script src="tableau.extensions.1.latest.js"></script>
+
+<style>
+  :root {
+    --ink: #1f2933;
+    --muted: #6b7785;
+    --border: #e2e6ea;
+    --accent: #1f77b4; /* Tableau blue-ish */
+    --accent-ink: #ffffff;
+    --bg: #ffffff;
+    --bg-subtle: #f7f8f9;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 13px;
+    color: var(--ink);
+    background: var(--bg);
+  }
+  #app { display: flex; flex-direction: column; height: 100vh; padding: 10px; }
+
+  #setup-row { display: flex; gap: 6px; margin-bottom: 8px; }
+  #setup-row select, #setup-row input {
+    flex: 1;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 13px;
+  }
+
+  #context-line {
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 8px;
+    padding: 6px 8px;
+    background: var(--bg-subtle);
+    border-radius: 4px;
+    word-break: break-word;
+  }
+
+  #comment-list {
+    flex: 1;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin-bottom: 8px;
+  }
+  .comment-item {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .comment-item:last-child { border-bottom: none; }
+  .comment-meta {
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 2px;
+  }
+  .comment-meta b { color: var(--ink); }
+  .comment-text { white-space: pre-wrap; }
+  .empty-state {
+    padding: 16px;
+    color: var(--muted);
+    text-align: center;
+  }
+
+  #compose-row { display: flex; gap: 6px; }
+  #compose-row textarea {
+    flex: 1;
+    resize: none;
+    height: 54px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 13px;
+  }
+  #compose-row button {
+    padding: 0 14px;
+    border: none;
+    border-radius: 4px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #compose-row button:disabled {
+    background: var(--border);
+    color: var(--muted);
+    cursor: default;
+  }
+
+  #status-line {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 4px;
+    min-height: 14px;
+  }
+</style>
+</head>
+<body>
+  <div id="app">
+    <div id="setup-row">
+      <select id="user-select"></select>
+    </div>
+    <div id="context-line">Loading context…</div>
+    <div id="comment-list"><div class="empty-state">Loading comments…</div></div>
+    <div id="compose-row">
+      <textarea id="comment-input" maxlength="1500" placeholder="Add a comment about what you're looking at…"></textarea>
+      <button id="submit-btn">Post</button>
+    </div>
+    <div id="status-line"></div>
+  </div>
+
+<script>
+(function () {
+  // ---- CONFIGURATION -------------------------------------------------
+  // Replace with the Web App URL you get from deploying apps-script/Code.gs
+  var WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbyPPvGXy4sbGHfJ6348xVXmMS2G9GZIBRcx4iaoa1zUCWKWPzmyfgroPR6PhNmlukhl-A/exec';
+
+  // Replace with your team's actual names. With only a handful of users,
+  // a dropdown is simpler and more reliable than trying to pull the
+  // signed-in Tableau username (which the Extensions API doesn't expose
+  // directly).
+  var USERS = ['Anamaria', 'Teammate 2', 'Teammate 3', 'Teammate 4', 'Teammate 5'];
+  // ---------------------------------------------------------------------
+
+  var dashboardName = null;
+  var worksheet = null;
+  var currentContext = '';
+
+  var elUserSelect = document.getElementById('user-select');
+  var elContextLine = document.getElementById('context-line');
+  var elCommentList = document.getElementById('comment-list');
+  var elCommentInput = document.getElementById('comment-input');
+  var elSubmitBtn = document.getElementById('submit-btn');
+  var elStatusLine = document.getElementById('status-line');
+
+  function setStatus(msg, isError) {
+    elStatusLine.textContent = msg || '';
+    elStatusLine.style.color = isError ? '#c0392b' : '#6b7785';
+  }
+
+  function populateUserSelect() {
+    var saved = tableau.extensions.settings.get('userName');
+    USERS.forEach(function (name) {
+      var opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      elUserSelect.appendChild(opt);
+    });
+    if (saved && USERS.indexOf(saved) !== -1) {
+      elUserSelect.value = saved;
+    }
+    elUserSelect.addEventListener('change', function () {
+      tableau.extensions.settings.set('userName', elUserSelect.value);
+      tableau.extensions.settings.saveAsync();
+    });
+  }
+
+  function getCurrentUser() {
+    return elUserSelect.value || USERS[0];
+  }
+
+  // Builds a stable, human-readable string describing "what is currently
+  // being looked at": the selected marks if there are any, otherwise the
+  // active filter values on the worksheet. Comments are matched against
+  // this string, so it intentionally stays simple/flat rather than a hash.
+  function computeContext() {
+    return worksheet.getSelectedMarksAsync().then(function (marksCollection) {
+      var pairs = [];
+      var summary = marksCollection.data && marksCollection.data[0];
+      if (summary && summary.data && summary.data.length > 0) {
+        var firstRow = summary.data[0];
+        summary.columns.forEach(function (col, i) {
+          pairs.push(col.fieldName + '=' + firstRow[i].formattedValue);
+        });
+        return pairs.join(' | ');
+      }
+      // No marks selected -- fall back to active filters.
+      return worksheet.getFiltersAsync().then(function (filters) {
+        filters.forEach(function (filter) {
+          if (filter.appliedValues && filter.appliedValues.length > 0) {
+            var values = filter.appliedValues.map(function (v) { return v.formattedValue; }).join(',');
+            pairs.push(filter.fieldName + '=' + values);
+          }
+        });
+        return pairs.join(' | ');
+      });
+    });
+  }
+
+  function renderComments(comments) {
+    elCommentList.innerHTML = '';
+    if (!comments || comments.length === 0) {
+      elCommentList.innerHTML = '<div class="empty-state">No comments yet for this context.</div>';
+      return;
+    }
+    comments.forEach(function (c) {
+      var item = document.createElement('div');
+      item.className = 'comment-item';
+      var when = new Date(c.timestamp).toLocaleString();
+      item.innerHTML =
+        '<div class="comment-meta"><b>' + escapeHtml(c.user) + '</b> &middot; ' + escapeHtml(when) + '</div>' +
+        '<div class="comment-text">' + escapeHtml(c.comment) + '</div>';
+      elCommentList.appendChild(item);
+    });
+  }
+
+  function escapeHtml(str) {
+    var div = document.createElement('div');
+    div.textContent = String(str == null ? '' : str);
+    return div.innerHTML;
+  }
+
+  // ---- JSONP transport --------------------------------------------------
+  // Apps Script Web App URLs have a known quirk: their internal redirect
+  // isn't CORS-friendly for fetch()-style cross-origin requests, so fetch()
+  // fails with a generic "Failed to fetch" even though the exact same URL
+  // works fine typed directly into a browser. Loading the URL via a
+  // <script> tag (JSONP) sidesteps this entirely, since script tags were
+  // never subject to CORS. Both reading and posting comments go through
+  // this instead of fetch() -- see Code.gs's doGet for the matching backend.
+  var jsonpCounter = 0;
+  function jsonpRequest(url) {
+    return new Promise(function (resolve, reject) {
+      var callbackName = '__writeback_jsonp_' + (jsonpCounter++) + '_' + Date.now();
+      var script = document.createElement('script');
+      var timeoutId;
+
+      function cleanup() {
+        delete window[callbackName];
+        if (script.parentNode) script.parentNode.removeChild(script);
+        clearTimeout(timeoutId);
+      }
+
+      window[callbackName] = function (data) {
+        cleanup();
+        resolve(data);
+      };
+
+      script.onerror = function () {
+        cleanup();
+        reject(new Error('Could not reach the server. Check WEB_APP_URL and your internet connection.'));
+      };
+
+      timeoutId = setTimeout(function () {
+        cleanup();
+        reject(new Error('Request timed out after 15 seconds.'));
+      }, 15000);
+
+      var sep = url.indexOf('?') === -1 ? '?' : '&';
+      script.src = url + sep + 'callback=' + callbackName;
+      document.head.appendChild(script);
+    });
+  }
+
+  function refreshContextAndComments() {
+    elContextLine.textContent = 'Loading context…';
+    return computeContext().then(function (context) {
+      currentContext = context;
+      elContextLine.textContent = context ? ('Context: ' + context) : 'Context: (whole dashboard, no filters/marks selected)';
+      return loadComments();
+    }).catch(function (err) {
+      // Previously this left "Loading context..." frozen forever with no
+      // visible error. Now it surfaces the failure in both places.
+      elContextLine.textContent = 'Could not determine context: ' + err.message;
+      elCommentList.innerHTML = '<div class="empty-state">Error computing context: ' + escapeHtml(err.message) + '</div>';
+    });
+  }
+
+  function loadComments() {
+    var url = WEB_APP_URL
+      + '?dashboard=' + encodeURIComponent(dashboardName)
+      + '&context=' + encodeURIComponent(currentContext);
+    return jsonpRequest(url)
+      .then(function (data) {
+        if (data.error) throw new Error(data.error);
+        renderComments(data.comments);
+      })
+      .catch(function (err) {
+        setStatus('Could not load comments: ' + err.message, true);
+        // Previously the "Loading comments..." placeholder stayed on screen
+        // forever on failure. Now it's replaced with the actual error.
+        elCommentList.innerHTML = '<div class="empty-state">Could not load comments: ' + escapeHtml(err.message) + '</div>';
+      });
+  }
+
+  function submitComment() {
+    var text = elCommentInput.value.trim();
+    if (!text) return;
+
+    elSubmitBtn.disabled = true;
+    setStatus('Posting…');
+
+    var url = WEB_APP_URL
+      + '?action=addComment'
+      + '&user=' + encodeURIComponent(getCurrentUser())
+      + '&dashboard=' + encodeURIComponent(dashboardName)
+      + '&context=' + encodeURIComponent(currentContext)
+      + '&comment=' + encodeURIComponent(text);
+
+    jsonpRequest(url)
+      .then(function (data) {
+        if (data.error) throw new Error(data.error);
+        elCommentInput.value = '';
+        setStatus('');
+        return loadComments();
+      })
+      .catch(function (err) {
+        setStatus('Could not post comment: ' + err.message, true);
+      })
+      .then(function () {
+        elSubmitBtn.disabled = false;
+      });
+  }
+
+  function init() {
+    if (WEB_APP_URL.indexOf('PASTE_YOUR') === 0) {
+      setStatus('Set WEB_APP_URL at the top of index.html before using this extension.', true);
+    }
+
+    populateUserSelect();
+
+    var dashboard = tableau.extensions.dashboardContent.dashboard;
+    dashboardName = dashboard.name;
+    // Uses the first worksheet on the dashboard as the comment "subject".
+    // If your dashboard has several worksheets you care about separately,
+    // swap this for a <select> of dashboard.worksheets.
+    worksheet = dashboard.worksheets[0];
+
+    if (!worksheet) {
+      elContextLine.textContent = 'No worksheets found on this dashboard.';
+      elCommentList.innerHTML = '<div class="empty-state">This dashboard has no worksheets for the extension to attach to.</div>';
+      return;
+    }
+
+    worksheet.addEventListener(tableau.TableauEventType.MarkSelectionChanged, refreshContextAndComments);
+    worksheet.addEventListener(tableau.TableauEventType.FilterChanged, refreshContextAndComments);
+
+    elSubmitBtn.addEventListener('click', submitComment);
+    elCommentInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitComment();
+    });
+
+    refreshContextAndComments();
+  }
+
+  var didInitialize = false;
+
+  // If nothing has happened after 8 seconds, the page is most likely stuck
+  // before initializeAsync even resolves (e.g. the library file didn't
+  // load, or this page was opened outside of Tableau). Surface that instead
+  // of leaving the static "Loading..." placeholders on screen forever.
+  setTimeout(function () {
+    if (didInitialize) return;
+    elContextLine.textContent = 'Still not connected to Tableau after 8s.';
+    elCommentList.innerHTML =
+      '<div class="empty-state">This usually means either:<br>' +
+      '1) tableau.extensions.1.latest.js failed to load (check it sits next to index.html, and check the browser Network tab for a 404), or<br>' +
+      '2) this page was opened directly in a browser instead of inside a Tableau extension object.</div>';
+  }, 8000);
+
+  try {
+    if (typeof tableau === 'undefined') {
+      throw new Error('tableau.extensions.1.latest.js did not load (the "tableau" global is undefined).');
+    }
+    tableau.extensions.initializeAsync().then(function () {
+      didInitialize = true;
+      init();
+    }).catch(function (err) {
+      didInitialize = true;
+      setStatus('Failed to initialize extension: ' + err.message, true);
+      elCommentList.innerHTML = '<div class="empty-state">Failed to initialize: ' + escapeHtml(err.message) + '</div>';
+    });
+  } catch (err) {
+    didInitialize = true;
+    elContextLine.textContent = 'Fatal error during startup.';
+    elCommentList.innerHTML = '<div class="empty-state">' + escapeHtml(err.message) + '</div>';
+  }
+})();
+</script>
+</body>
+</html>
